@@ -14,16 +14,17 @@
 
 import collections
 import logging
+import os
 import time
 
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum, auto
 from typing import Literal, TypeAlias
 
 import arviz as az
-import filelock
 import jax
 import numpy as np
 import pymc as pm
@@ -60,6 +61,7 @@ from rich.padding import Padding
 from rich.progress import BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.table import Table
 from rich.text import Text
+from threadpoolctl import threadpool_limits
 
 # TODO: change to typing.Self after Python versions greater than 3.10
 from typing_extensions import Self
@@ -985,129 +987,6 @@ def make_single_pathfinder_fn(
     return single_pathfinder_fn
 
 
-def _calculate_max_workers() -> int:
-    """
-    calculate the default number of workers to use for concurrent pathfinder runs.
-    """
-
-    # from limited testing, setting values higher than 0.3 makes multiprocessing a lot slower.
-    import multiprocessing
-
-    total_cpus = multiprocessing.cpu_count() or 1
-    processes = max(2, int(total_cpus * 0.3))
-    if processes % 2 != 0:
-        processes += 1
-    return processes
-
-
-def _thread(fn: SinglePathfinderFn, seed: int) -> "PathfinderResult":
-    """
-    execute pathfinder runs concurrently using threading.
-    """
-
-    # kernel crashes without lock_ctx
-    from pytensor.compile.compilelock import lock_ctx
-
-    with lock_ctx():
-        rng = np.random.default_rng(seed)
-        result = fn(rng)
-    return result
-
-
-def _process(fn: SinglePathfinderFn, seed: int) -> "PathfinderResult | bytes":
-    """
-    execute pathfinder runs concurrently using multiprocessing.
-    """
-    import cloudpickle
-
-    from pytensor.compile.compilelock import lock_ctx
-
-    with lock_ctx():
-        in_out_pickled = isinstance(fn, bytes)
-        fn = cloudpickle.loads(fn)
-        rng = np.random.default_rng(seed)
-        result = fn(rng) if not in_out_pickled else cloudpickle.dumps(fn(rng))
-    return result
-
-
-def _get_mp_context(mp_ctx: str | None = None) -> str | None:
-    """code snippet taken from ParallelSampler in pymc/pymc/sampling/parallel.py"""
-    import multiprocessing
-    import platform
-
-    if mp_ctx is None or isinstance(mp_ctx, str):
-        if mp_ctx is None and platform.system() == "Darwin":
-            if platform.processor() == "arm":
-                mp_ctx = "fork"
-                logger.debug(
-                    "mp_ctx is set to 'fork' for MacOS with ARM architecture. "
-                    + "This might cause unexpected behavior with JAX, which is inherently multithreaded."
-                )
-            else:
-                mp_ctx = "forkserver"
-
-        mp_ctx = multiprocessing.get_context(mp_ctx)
-    return mp_ctx
-
-
-def _execute_concurrently(
-    fn: SinglePathfinderFn,
-    seeds: list[int],
-    concurrent: Literal["thread", "process"] | None,
-    max_workers: int | None = None,
-) -> Iterator["PathfinderResult | bytes"]:
-    """
-    execute pathfinder runs concurrently.
-    """
-    if concurrent == "thread":
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-    elif concurrent == "process":
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-
-        import cloudpickle
-    else:
-        raise ValueError(f"Invalid concurrent value: {concurrent}")
-
-    executor_cls = ThreadPoolExecutor if concurrent == "thread" else ProcessPoolExecutor
-
-    concurrent_fn = _thread if concurrent == "thread" else _process
-
-    executor_kwargs = {} if concurrent == "thread" else {"mp_context": _get_mp_context()}
-
-    max_workers = max_workers or (None if concurrent == "thread" else _calculate_max_workers())
-
-    fn = fn if concurrent == "thread" else cloudpickle.dumps(fn)
-
-    with executor_cls(max_workers=max_workers, **executor_kwargs) as executor:
-        futures = [executor.submit(concurrent_fn, fn, seed) for seed in seeds]
-        for f in as_completed(futures):
-            yield (f.result() if concurrent == "thread" else cloudpickle.loads(f.result()))
-
-
-def _execute_serially(fn: SinglePathfinderFn, seeds: list[int]) -> Iterator["PathfinderResult"]:
-    """
-    execute pathfinder runs serially.
-    """
-    for seed in seeds:
-        rng = np.random.default_rng(seed)
-        yield fn(rng)
-
-
-def make_generator(
-    concurrent: Literal["thread", "process"] | None,
-    fn: SinglePathfinderFn,
-    seeds: list[int],
-    max_workers: int | None = None,
-) -> Iterator["PathfinderResult | bytes"]:
-    """
-    generator for executing pathfinder runs concurrently or serially.
-    """
-    if concurrent is not None:
-        yield from _execute_concurrently(fn, seeds, concurrent, max_workers)
-    else:
-        yield from _execute_serially(fn, seeds)
-
-
 @dataclass(slots=True, frozen=True)
 class PathfinderResult:
     """
@@ -1135,6 +1014,59 @@ class PathfinderResult:
     elbo_argmax: NDArray | None = None
     lbfgs_status: LBFGSStatus = LBFGSStatus.LBFGS_FAILED
     path_status: PathStatus = PathStatus.PATH_FAILED
+
+
+def execute_with_threadpool(
+    fn: SinglePathfinderFn, seeds: list[int], max_threads: int | None = None
+) -> list[PathfinderResult]:
+    """
+    Execute pathfinder runs using ThreadPoolExecutor for parallelism, with thread control via threadpoolctl.
+
+    Parameters
+    ----------
+    fn : SinglePathfinderFn
+        The pathfinder function to execute.
+    seeds : list[int]
+        List of random seeds for each pathfinder run.
+    max_threads : int, optional
+        Maximum number of threads to use for parallelism. Defaults to the number of available CPU cores.
+
+    Returns
+    -------
+    list[PathfinderResult]
+        Results from each pathfinder run.
+    """
+    if max_threads is None:
+        max_threads = os.cpu_count()
+
+    results = []
+    with threadpool_limits(limits=max_threads):
+        with ThreadPoolExecutor(max_threads) as executor:
+            futures = [executor.submit(fn, seed) for seed in seeds]
+            for future in futures:
+                results.append(future.result())
+    return results
+
+
+def _thread(fn: SinglePathfinderFn, seed: int) -> "PathfinderResult":
+    """
+    Execute pathfinder runs concurrently using threading.
+
+    Parameters
+    ----------
+    fn : SinglePathfinderFn
+        The pathfinder function to execute.
+    seed : int
+        Random seed for the pathfinder run.
+
+    Returns
+    -------
+    PathfinderResult
+        The result of the pathfinder run.
+    """
+    rng = np.random.default_rng(seed)
+    result = fn(rng)
+    return result
 
 
 @dataclass(frozen=True)
@@ -1508,13 +1440,6 @@ def multipath_pathfinder(
     )
     compile_end = time.time()
 
-    # NOTE: from limited tests, no concurrency is faster than thread, and thread is faster than process. But I suspect this also depends on the model size and maxcor setting.
-    generator = make_generator(
-        concurrent=concurrent,
-        fn=single_pathfinder_fn,
-        seeds=path_seeds,
-    )
-
     results = []
     compute_start = time.time()
     try:
@@ -1531,39 +1456,15 @@ def multipath_pathfinder(
         )
         with progress:
             task = progress.add_task(desc.format(path_idx=0), completed=0, total=num_paths)
-            for path_idx, result in enumerate(generator, start=1):
-                try:
-                    if isinstance(result, Exception):
-                        raise result
-                    else:
-                        results.append(result)
-                except filelock.Timeout:
-                    logger.warning("Lock timeout. Retrying...")
-                    num_attempts = 0
-                    while num_attempts < 10:
-                        try:
-                            results.append(result)
-                            logger.info("Lock acquired. Continuing...")
-                            break
-                        except filelock.Timeout:
-                            num_attempts += 1
-                            time.sleep(0.5)
-                            logger.warning(f"Lock timeout. Retrying... ({num_attempts}/10)")
-                except Exception as e:
-                    logger.warning("Unexpected error in a path: %s", str(e))
-                    results.append(
-                        PathfinderResult(
-                            path_status=PathStatus.PATH_FAILED,
-                            lbfgs_status=LBFGSStatus.LBFGS_FAILED,
-                        )
-                    )
-                finally:
-                    # TODO: display LBFGS and Path Status in real time
-                    progress.update(
-                        task,
-                        description=desc.format(path_idx=path_idx),
-                        completed=path_idx,
-                    )
+            results = execute_with_threadpool(
+                single_pathfinder_fn, path_seeds, max_threads=num_paths
+            )
+            for path_idx in range(1, num_paths + 1):
+                progress.update(
+                    task,
+                    description=desc.format(path_idx=path_idx),
+                    completed=path_idx,
+                )
             # Ensure the progress bar visually reaches 100% and shows 'Completed'
             progress.update(task, completed=num_paths, description="Completed")
     except (KeyboardInterrupt, StopIteration) as e:
